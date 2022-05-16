@@ -19,7 +19,7 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel
 from torch.distributed.fsdp.shard_utils import _gather_state_dict
-from torch.distributed.fsdp.wrap import enable_wrap, wrap
+from torch.distributed.fsdp.wrap import enable_wrap, wrap, size_based_auto_wrap_policy
 from torch.nn import Linear, Module
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import SGD
@@ -31,6 +31,8 @@ from torch.testing._internal.common_fsdp import (
     _get_state_dict,
     SkipModel,
     _zero_model,
+    TransformerWithSharedParams,
+    _validate,
 )
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -139,6 +141,36 @@ class TestFSDPStateDict(FSDPTest):
                     )
             else:
                 self.assertEqual(fsdp_state_dict, {})
+
+    @skip_if_lt_x_gpu(2)
+    def state_dict_rank0_offload_save_load_flow(self):
+        # Test taking checkpoint on rank 0 only, and reload
+        # without redundant CPU memories.
+        ctx = self._get_state_dict_mgr(
+            model, "state_dict", True
+        )
+        model = TransformerWithSharedParams(group=dist.distributed_c10d._get_default_group())
+        model = FSDP(model, auto_wrap_policy=size_based_auto_wrap_policy)
+        with ctx:
+            state_dict = deepcopy(_get_state_dict(model))
+
+        # All ranks initialize non-FSDP model
+        model_new = TransformerWithSharedParams(group=dist.distributed_c10d._get_default_group())
+        # Only rank 0 loads the checkpoint
+        if self.rank == 0:
+            model_new.load_state_dict(state_dict)
+
+        _validate(model_new, process_group=self.process_group, assert_fn=self.assertNotEqual)
+        # FSDP with sync_module_states=True broadcasts the checkpointed states.
+        model_new = FSDP(model_new, auto_wrap_policy=size_based_auto_wrap_policy, sync_module_states=True)
+        # After wrapping with FSDP models are equal across ranks, and have loaded the checkpoint
+        _validate(model_new, process_group=self.process_group, assert_fn=self.assertEqual)
+
+        with FullyShardedDataParallel.summon_full_params(model):
+            with FullyShardedDataParallel.summon_full_params(model_new):
+                params = list(model.parameters())
+                params_new = list(model_new.parameters())
+                self.assertNotEqual(params, params_new)
 
     @skip_if_lt_x_gpu(2)
     @parametrize("state_dict_type", _SUPPORTED_STATE_DICT_IMPLS)
